@@ -51,3 +51,33 @@ WSL graphics paths.
 The pinned headers build with GCC and strict warnings. Cloud verification
 covered the fresh-process FD transfer fixture and the expected no-GPU
 skip; actual DXG GPU handle import still needs a WSL hardware run.
+
+## 2D GPU render-target test
+
+The default invocation above keeps the original 64 KiB buffer test.
+If you already cloned the probe, update this experimental branch and
+add `--texture`:
+
+```sh
+git -C dxg-share-probe pull --ff-only
+YDXG_ADAPTER="RTX A4000" \
+  sh dxg-share-probe/experiments/dxg-shared-resource/build-and-run.sh DirectX-Headers --texture
+```
+
+The producer creates a shared GPU-local 71×43 RGBA8 2D render target
+with the driver's chosen texture layout. It writes a background and
+four asymmetric, partially overlapping rectangles using D3D12 render
+target clears, not a CPU image upload. This tests a GPU render-target
+operation, not a custom shader pipeline. Both devices use fences and
+return the shared texture to COMMON between operations. The importer
+checks texture kind, dimensions, format, and render-target flag, then
+uses `CopyTextureRegion` to copy to its own readback buffer. It checks
+each RGBA pixel with the GPU's padded row pitch, including alpha and
+overlap. It prints a separate, texture-specific PASS if this works.
+
+`--test-texture` exercises the CPU-side verifier without a GPU; its
+fixture verifies pitch, channel order, orientation, and expected colors.
+It is not proof of hardware acceptance. A hardware texture PASS would
+show cross-process D3D12 render-target sharing for this format and
+adapter. It still does **not** show that the resource can become a
+Linux DMA-BUF or a Wayland buffer.

@@ -4,7 +4,7 @@
 set -eu
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-    printf 'usage: %s path/to/DirectX-Headers [--test-ipc]\n' "$0" >&2
+    printf 'usage: %s path/to/DirectX-Headers [--texture|--test-texture|--test-ipc]\n' "$0" >&2
     exit 64
 fi
 if ! headers=$(CDPATH='' cd -- "$1" && pwd); then exit 64; fi

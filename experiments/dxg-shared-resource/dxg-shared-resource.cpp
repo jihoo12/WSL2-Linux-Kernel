@@ -18,11 +18,89 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 using Microsoft::WRL::ComPtr;
 namespace {
 constexpr size_t bytes = 64 * 1024;
+constexpr unsigned width = 71, height = 43;
+constexpr auto texture_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+struct ClearRegion {
+    D3D12_RECT rect;
+    unsigned color;
+};
+constexpr ClearRegion regions[] = {
+    {{3, 4, 32, 22}, 1},
+    {{24, 13, 57, 36}, 2},
+    {{51, 1, 69, 9}, 4},
+    {{5, 29, 13, 42}, 7},
+};
+
+unsigned region_color(unsigned color, uint32_t seed) {
+    return color ^ (seed & 15u);
+}
+
+void rgba_bytes(unsigned color, unsigned char (&rgba)[4]) {
+    for (unsigned k = 0; k < 4; ++k)
+        rgba[k] = (color & (1u << k)) ? 255 : 0;
+}
+
+bool texture_matches(const unsigned char *pixels, size_t pitch, uint32_t seed,
+                     bool report = true) {
+    if (pitch < width * 4) return false;
+    for (unsigned y = 0; y < height; ++y) {
+        for (unsigned x = 0; x < width; ++x) {
+            unsigned color = 8;
+            for (const auto &r : regions)
+                if (x >= static_cast<unsigned>(r.rect.left) && x < static_cast<unsigned>(r.rect.right) &&
+                    y >= static_cast<unsigned>(r.rect.top) && y < static_cast<unsigned>(r.rect.bottom))
+                    color = r.color;
+            unsigned char rgba[4];
+            rgba_bytes(region_color(color, seed), rgba);
+            const auto *got = pixels + y * pitch + x * 4;
+            if (std::memcmp(got, rgba, sizeof(rgba)) != 0) {
+                if (report)
+                    std::fprintf(stderr, "Texture mismatch at (%u,%u): expected %u,%u,%u,%u; got %u,%u,%u,%u\n",
+                        x, y, rgba[0], rgba[1], rgba[2], rgba[3], got[0], got[1], got[2], got[3]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool test_texture_verifier() {
+    constexpr size_t pitch = 512;
+    constexpr uint32_t seed = 0;
+    std::vector<unsigned char> data(height * pitch, 0xca);
+    // Independent fixture construction: paint literal RGBA bytes, including
+    // the overlap and deliberately opaque background.
+    auto paint = [&](unsigned left, unsigned top, unsigned right, unsigned bottom,
+                     unsigned char red, unsigned char green, unsigned char blue, unsigned char alpha) {
+        const unsigned char rgba[]{red, green, blue, alpha};
+        for (unsigned y = top; y < bottom; ++y)
+            for (unsigned x = left; x < right; ++x)
+                std::memcpy(data.data() + y * pitch + x * 4, rgba, sizeof(rgba));
+    };
+    paint(0, 0, 71, 43, 0, 0, 0, 255);
+    paint(3, 4, 32, 22, 255, 0, 0, 0);
+    paint(24, 13, 57, 36, 0, 255, 0, 0);
+    paint(51, 1, 69, 9, 0, 0, 255, 0);
+    paint(5, 29, 13, 42, 255, 255, 255, 0);
+    if (!texture_matches(data.data(), pitch, seed) ||
+        texture_matches(data.data(), width * 4, seed, false) ||
+        texture_matches(data.data(), pitch, seed + 1, false))
+        return false;
+    std::vector<unsigned char> flipped(height * pitch);
+    for (unsigned y = 0; y < height; ++y)
+        std::memcpy(flipped.data() + y * pitch, data.data() + (height - 1 - y) * pitch, pitch);
+    if (texture_matches(flipped.data(), pitch, seed, false)) return false;
+    const auto idx = 4 * pitch + 3 * 4;
+    data[idx] = 0;
+    data[idx + 2] = 255;
+    return !texture_matches(data.data(), pitch, seed, false);
+}
 struct Fd {
     int fd = -1;
     Fd() = default;
@@ -37,6 +115,7 @@ struct Packet {
     uint32_t low = 0;
     int32_t high = 0;
     uint32_t seed = 0;
+    uint32_t texture = 0;
 };
 
 bool transfer(int sock, Packet &payload, Fd &fd, bool send) {
@@ -147,20 +226,25 @@ bool make_device(Runtime &r, Packet &packet, bool consumer, ComPtr<ID3D12Device>
 }
 
 bool make_buffer(ID3D12Device &dev, D3D12_HEAP_TYPE type, D3D12_HEAP_FLAGS flags,
-                 D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource> &resource) {
+                 D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource> &resource,
+                 UINT64 length = bytes) {
     D3D12_HEAP_PROPERTIES props{};
     props.Type = type;
     props.CreationNodeMask = props.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    d.Width = bytes;
+    d.Width = length;
     d.Height = d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     return ok("CreateCommittedResource", dev.CreateCommittedResource(&props, flags, &d, state,
                                  nullptr, IID_PPV_ARGS(&resource)));
 }
 
-bool copy_and_wait(ID3D12Device &dev, ID3D12Resource &shared, ID3D12Resource &staging, bool consume) {
+enum class Operation { WriteBuffer, ReadBuffer, PaintTexture, ReadTexture };
+
+bool execute_and_wait(ID3D12Device &dev, ID3D12Resource &shared, ID3D12Resource *staging,
+                      Operation operation, uint32_t seed,
+                      const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *fp = nullptr) {
     D3D12_COMMAND_QUEUE_DESC desc{};
     desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     ComPtr<ID3D12CommandQueue> queue;
@@ -176,9 +260,39 @@ bool copy_and_wait(ID3D12Device &dev, ID3D12Resource &shared, ID3D12Resource &st
     barrier.Transition.pResource = &shared;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = consume ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
+    const bool paint = operation == Operation::PaintTexture;
+    const bool read = operation == Operation::ReadBuffer || operation == Operation::ReadTexture;
+    barrier.Transition.StateAfter = paint ? D3D12_RESOURCE_STATE_RENDER_TARGET :
+        read ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
+    ComPtr<ID3D12DescriptorHeap> rtv;
     cmd->ResourceBarrier(1, &barrier);
-    cmd->CopyBufferRegion(consume ? &staging : &shared, 0, consume ? &shared : &staging, 0, bytes);
+    if (paint) {
+        D3D12_DESCRIPTOR_HEAP_DESC heap{};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heap.NumDescriptors = 1;
+        if (!ok("CreateDescriptorHeap(RTV)", dev.CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtv))))
+            return false;
+        const auto target = rtv->GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&shared, nullptr, target);
+        auto clear = [&](unsigned idx, const D3D12_RECT *rect) {
+            const unsigned color = region_color(idx, seed);
+            const FLOAT rgba[] = {FLOAT(bool(color & 1)), FLOAT(bool(color & 2)),
+                                  FLOAT(bool(color & 4)), FLOAT(bool(color & 8))};
+            cmd->ClearRenderTargetView(target, rgba, rect ? 1 : 0, rect);
+        };
+        clear(8, nullptr);
+        for (const auto &r : regions) clear(r.color, &r.rect);
+    } else if (operation == Operation::ReadTexture) {
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        src.pResource = &shared;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource = staging;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = *fp;
+        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    } else {
+        cmd->CopyBufferRegion(read ? staging : &shared, 0, read ? &shared : staging, 0, bytes);
+    }
     const auto transfer_state = barrier.Transition.StateAfter;
     barrier.Transition.StateAfter = barrier.Transition.StateBefore;
     barrier.Transition.StateBefore = transfer_state;
@@ -204,26 +318,58 @@ bool copy_and_wait(ID3D12Device &dev, ID3D12Resource &shared, ID3D12Resource &st
     }
 }
 
-bool produce(int sock, ComPtr<ID3D12Resource> &shared, Runtime &r, ComPtr<ID3D12Device> &dev) {
+D3D12_RESOURCE_DESC texture_desc() {
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = width;
+    d.Height = height;
+    d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
+    d.Format = texture_format;
+    d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    return d;
+}
+
+bool make_texture(ID3D12Device &dev, ComPtr<ID3D12Resource> &resource) {
+    D3D12_HEAP_PROPERTIES props{};
+    props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    props.CreationNodeMask = props.VisibleNodeMask = 1;
+    const auto d = texture_desc();
+    return ok("CreateCommittedResource(shared GPU render-target texture)",
+        dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_SHARED, &d,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource)));
+}
+
+bool produce(int sock, ComPtr<ID3D12Resource> &shared, Runtime &r, ComPtr<ID3D12Device> &dev,
+             bool texture) {
     Packet packet{};
+    packet.texture = texture;
     if (getrandom(&packet.seed, sizeof(packet.seed), 0) != sizeof(packet.seed)) {
         perror("getrandom");
         return false;
     }
     if (!make_device(r, packet, false, dev)) return false;
-    ComPtr<ID3D12Resource> upload;
-    if (!make_buffer(*dev.Get(), D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED,
-            D3D12_RESOURCE_STATE_COMMON, shared) ||
-        !make_buffer(*dev.Get(), D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE,
-            D3D12_RESOURCE_STATE_GENERIC_READ, upload)) return false;
+    if (texture) {
+        if (!make_texture(*dev.Get(), shared) ||
+            !execute_and_wait(*dev.Get(), *shared.Get(), nullptr, Operation::PaintTexture, packet.seed))
+            return false;
+        std::printf("Producer GPU rendered %ux%u RGBA8 via RTV clears (no CPU upload)\n", width, height);
+    } else {
+        ComPtr<ID3D12Resource> upload;
+        if (!make_buffer(*dev.Get(), D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED,
+                D3D12_RESOURCE_STATE_COMMON, shared) ||
+            !make_buffer(*dev.Get(), D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ, upload)) return false;
 
-    const D3D12_RANGE none{0, 0}, full{0, bytes};
-    void *mapping = nullptr;
-    if (!ok("Upload map", upload->Map(0, &none, &mapping))) return false;
-    for (size_t i = 0; i < bytes; ++i)
-        static_cast<unsigned char *>(mapping)[i] = pattern(i, packet.seed);
-    upload->Unmap(0, &full);
-    if (!copy_and_wait(*dev.Get(), *shared.Get(), *upload.Get(), false)) return false;
+        const D3D12_RANGE none{0, 0}, full{0, bytes};
+        void *mapping = nullptr;
+        if (!ok("Upload map", upload->Map(0, &none, &mapping))) return false;
+        for (size_t i = 0; i < bytes; ++i)
+            static_cast<unsigned char *>(mapping)[i] = pattern(i, packet.seed);
+        upload->Unmap(0, &full);
+        if (!execute_and_wait(*dev.Get(), *shared.Get(), upload.Get(), Operation::WriteBuffer, packet.seed))
+            return false;
+    }
 
     HANDLE handle{};
     if (!ok("CreateSharedHandle", dev->CreateSharedHandle(shared.Get(), nullptr, GENERIC_ALL, nullptr, &handle)))
@@ -261,12 +407,48 @@ int consume(int sock, bool fixture) {
     Runtime r;
     ComPtr<ID3D12Device> dev;
     ComPtr<ID3D12Resource> shared, readback;
-    if (!r.load() || !make_device(r, packet, true, dev) ||
+    if (packet.texture > 1 || !r.load() || !make_device(r, packet, true, dev) ||
         !ok("OpenSharedHandle in importer", dev->OpenSharedHandle(
-           reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd.fd)), IID_PPV_ARGS(&shared))) ||
-        !make_buffer(*dev.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE,
+           reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd.fd)), IID_PPV_ARGS(&shared)))) return 2;
+    if (packet.texture) {
+        const auto d = shared->GetDesc();
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            d.Width != width || d.Height != height || d.Format != texture_format ||
+            d.DepthOrArraySize != 1 || d.MipLevels != 1 || d.SampleDesc.Count != 1 ||
+            !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+            std::fputs("Imported resource does not match expected RGBA8 render target\n", stderr);
+            return 2;
+        }
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT rows = 0;
+        UINT64 row_size = 0, size = 0;
+        dev->GetCopyableFootprints(&d, 0, 1, 0, &fp, &rows, &row_size, &size);
+        if (!size || size > 1024 * 1024 || fp.Offset >= size || rows != height ||
+            row_size != width * 4 || fp.Footprint.RowPitch < row_size ||
+            fp.Footprint.RowPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT ||
+            fp.Offset + (height - 1) * UINT64(fp.Footprint.RowPitch) + row_size > size) {
+            std::fputs("Unexpected readback footprint\n", stderr);
+            return 2;
+        }
+        if (!make_buffer(*dev.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST, readback, size) ||
+            !execute_and_wait(*dev.Get(), *shared.Get(), readback.Get(),
+                Operation::ReadTexture, packet.seed, &fp)) return 2;
+        const D3D12_RANGE full{size_t(fp.Offset), size_t(size)}, none{0, 0};
+        void *mapping = nullptr;
+        if (!ok("Texture readback map", readback->Map(0, &full, &mapping))) return 2;
+        const auto *pixels = static_cast<const unsigned char *>(mapping) + fp.Offset;
+        std::printf("Importer copied %ux%u RGBA8, row pitch %u\n", width, height, fp.Footprint.RowPitch);
+        const bool same = texture_matches(pixels, fp.Footprint.RowPitch, packet.seed);
+        readback->Unmap(0, &none);
+        if (!same) return 2;
+        std::puts("PASS: independent process imported the GPU-rendered D3D12 texture; exact asymmetric RGBA pixels match (not DMA-BUF)");
+        return 0;
+    }
+    if (!make_buffer(*dev.Get(), D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE,
             D3D12_RESOURCE_STATE_COPY_DEST, readback) ||
-        !copy_and_wait(*dev.Get(), *shared.Get(), *readback.Get(), true)) return 2;
+        !execute_and_wait(*dev.Get(), *shared.Get(), readback.Get(), Operation::ReadBuffer, packet.seed))
+        return 2;
     const D3D12_RANGE full{0, bytes}, none{0, 0};
     void *mapping = nullptr;
     if (!ok("Readback map", readback->Map(0, &full, &mapping))) return 2;
@@ -294,9 +476,15 @@ int main(int argc, char **argv) {
         return consume(socket.fd, !std::strcmp(argv[1], "--receive-fixture"));
     }
 
+    if (argc == 2 && !std::strcmp(argv[1], "--test-texture")) {
+        if (!test_texture_verifier()) return 2;
+        std::puts("PASS: padded RGBA texture validator rejects wrong pitch, seed, vertical flip and channel swap (not GPU)");
+        return 0;
+    }
     const bool fixture = argc == 2 && !std::strcmp(argv[1], "--test-ipc");
-    if (argc != 1 && !fixture) {
-        std::fprintf(stderr, "usage: %s [--test-ipc]\n", argv[0]);
+    const bool texture = argc == 2 && !std::strcmp(argv[1], "--texture");
+    if (argc != 1 && !fixture && !texture) {
+        std::fprintf(stderr, "usage: %s [--texture|--test-texture|--test-ipc]\n", argv[0]);
         return 64;
     }
     struct stat st{};
@@ -337,7 +525,7 @@ int main(int argc, char **argv) {
             sent = write(output.fd, "X", 1) == 1 && transfer(to_child.fd, packet, input, true);
         }
     } else if (r.load()) {
-        sent = produce(to_child.fd, shared, r, dev);
+        sent = produce(to_child.fd, shared, r, dev, texture);
     }
     to_child.reset();
     // Keep the source device and resource alive until the importer exits.
